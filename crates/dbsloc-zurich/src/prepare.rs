@@ -49,7 +49,8 @@ fn scrub_sidecar(source: Option<&Path>, dest: &Path, modality: &str) -> Result<(
     let value = match source {
         Some(p) => serde_json::from_reader(BufReader::new(
             File::open(p).map_err(|e| io("open converter sidecar", e))?,
-        ))?,
+        ))
+        .unwrap_or(serde_json::Value::Null),
         None => serde_json::Value::Null,
     };
     let mut safe = serde_json::Map::new();
@@ -402,6 +403,20 @@ mod tests {
         assert!(value.get("StudyDate").is_none());
         assert!(value.get("RepetitionTime").is_none());
         assert!(!value.to_string().contains("SECRET"));
+        Ok(())
+    }
+    #[test]
+    fn malformed_sidecar_keeps_only_generic_modality() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let src = temp.path().join("raw.json");
+        let dst = temp.path().join("safe.json");
+        std::fs::write(
+            &src,
+            b"{\"EchoTime\":0.003,\"SeriesDescription\":\"private\x01text\"}",
+        )?;
+        scrub_sidecar(Some(&src), &dst, "MR")?;
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(dst)?)?;
+        assert_eq!(value, serde_json::json!({"Modality":"MR"}));
         Ok(())
     }
     #[test]

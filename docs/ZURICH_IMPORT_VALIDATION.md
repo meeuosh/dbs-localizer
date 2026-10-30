@@ -1,5 +1,7 @@
 # Zurich import verification — 2026-10-30
 
+Owner-authorized cohort follow-up: all 14 remaining supplied patient folders were attempted. Four completed localization, three retained localization failures after both TRAC/CORE and PaCER, and seven lacked an eligible scan pair. Six of the seven imported subjects included multiple MR contrasts. A T2-only subject completed after matching the normalization template to T2. The previously processed subject's 41 files were unchanged. Scan choices, failed attempts, unapproved registration overlays and a consolidated report remain in the owner's dataset outside Git. Updated checks: 16 backend tests and 4 cohort-runner tests, release build and clippy passed.
+
 Scope: native scan selection, reviewed conversion and import into the existing Localizer dataset format. Contract: [specification 17](../specs/17_zurich_import.md). Imaging and generated datasets remain outside Git.
 
 ## Automated checks
