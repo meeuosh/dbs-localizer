@@ -12,6 +12,9 @@ use dbsloc_zurich::{Candidate, ElectrodeEvidence, Modality, Scan};
 use serde_json::{json, Value};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
+#[path = "cohort/fallback.rs"]
+mod fallback;
+
 const STAGES: &str = "bids,preprocess,precoreg,coreg,normalize,brainshift,reconstruct,visualize";
 
 fn canonical(path: &Path) -> Result<PathBuf> {
@@ -38,10 +41,11 @@ fn extras(scan: &Scan, primary: usize) -> Vec<usize> {
         if i == primary
             || c.modality != Modality::Mr
             || !c.eligible
-            || c.evidence != ElectrodeEvidence::LikelyAbsent
+            || !fallback::valid_mri(c)
             || c.explicit_postop
             || !import::PREOP_SUFFIXES.contains(&suffix)
             || c.suffix == anchor.suffix
+            || (anchor.suffix.as_deref() != Some("T1w") && suffix == "T1w")
         {
             continue;
         }
@@ -132,24 +136,25 @@ fn qc(dataset: &Path, id: &str) -> Result<Value> {
     )
 }
 
-fn process(source: &Path, dataset: &Path, binary: &Path, id: &str, logs: &Path) -> Result<Value> {
+fn process_pair(
+    scan: &Scan,
+    mri: usize,
+    ct: usize,
+    dataset: &Path,
+    binary: &Path,
+    id: &str,
+    logs: &Path,
+) -> Result<Value> {
     let cancel = AtomicBool::new(false);
-    let scan = dbsloc_zurich::scan_patient(source, &cancel, |_| {})?;
-    let (Some(mri), Some(ct)) = (scan.preop_mri, scan.postop_ct) else {
-        return Ok(
-            json!({"subject":id,"status":"skipped","reason":"missing eligible pre-op MRI or electrode-positive CT", "warnings":scan.warnings}),
-        );
-    };
-    let extra = extras(&scan, mri);
+    let extra = extras(scan, mri);
     let mut selected = vec![choice(&scan.candidates[mri]), choice(&scan.candidates[ct])];
     let patient = logs.join(format!("sub-{id}"));
     std::fs::create_dir(&patient)?;
-    let mut audit =
-        json!({"subject":id,"status":"preparing","selected":selected,"warnings":scan.warnings});
+    let mut audit = json!({"subject":id,"status":"preparing","selected":selected,"warnings":scan.warnings,"date_policy":"Anonymized dates advisory; MRI pre-op status requires manual review"});
     atomic_json(&patient.join("scan_choices.json"), &audit)?;
     let temp = tempfile::tempdir()?;
     let mut items = dbsloc_zurich::prepare_selection(
-        &scan,
+        scan,
         mri,
         ct,
         &temp.path().join("primary"),
@@ -159,7 +164,7 @@ fn process(source: &Path, dataset: &Path, binary: &Path, id: &str, logs: &Path) 
     let mut warnings = Vec::new();
     for (k, index) in extra.into_iter().enumerate() {
         match dbsloc_zurich::prepare_selection(
-            &scan,
+            scan,
             index,
             ct,
             &temp.path().join(format!("extra-{k}")),
@@ -194,7 +199,14 @@ fn process(source: &Path, dataset: &Path, binary: &Path, id: &str, logs: &Path) 
     )?;
     let pipeline_json = patient.join("pipeline.json");
     let stderr = patient.join("pipeline.stderr.log");
-    let status = command(binary, dataset, id)
+    let mut cmd = command(binary, dataset, id);
+    configure_template(
+        &mut cmd,
+        dataset,
+        items.iter().any(|i| i.suffix == "T1w"),
+        items.iter().any(|i| i.suffix == "T2w"),
+    )?;
+    let status = cmd
         .stdout(Stdio::from(File::create(&pipeline_json)?))
         .stderr(Stdio::from(File::create(&stderr)?))
         .status();
@@ -207,7 +219,8 @@ fn process(source: &Path, dataset: &Path, binary: &Path, id: &str, logs: &Path) 
         Ok(s) => (s.success(), s.code(), None),
         Err(e) => (false, None, Some(e.to_string())),
     };
-    let complete = success && reconstruction.is_file();
+    let complete =
+        success && fallback::traced(dataset, id) && review["status"] == "pending_manual_review";
     let result = json!({"subject":id,"status":if complete {"processed_pending_review"}else{"failed"},
         "pipeline_exit_code":exit_code,"launch_error":error,"reconstruction_exists":reconstruction.is_file(),
         "modalities":items.iter().map(|i|i.suffix.as_str()).collect::<Vec<_>>(),"warnings":warnings,
@@ -216,36 +229,235 @@ fn process(source: &Path, dataset: &Path, binary: &Path, id: &str, logs: &Path) 
     Ok(result)
 }
 
+fn configure_template(cmd: &mut Command, dataset: &Path, t1: bool, t2: bool) -> Result<()> {
+    if !t1 && t2 {
+        let opts = RunOptions::new(dataset, "check").with_resolved_template();
+        let template = opts
+            .normalization_template_t2
+            .ok_or("T2-only scan needs a shipped T2 template")?;
+        cmd.arg("--template")
+            .arg(canonical(&template)?)
+            .arg("--no-norm-multispectral");
+    }
+    cmd.env("DBSLOC_STOP_ON_ERROR", "1");
+    Ok(())
+}
+
+fn finalize(dataset: &Path, binary: &Path, id: &str, log: &Path) -> Result<()> {
+    let rows: Value = serde_json::from_reader(File::open(
+        dataset
+            .join("rawdata")
+            .join(format!("sub-{id}/rawimages.json")),
+    )?)?;
+    let data = rows.to_string();
+    let mut cmd = command(binary, dataset, id);
+    cmd.arg("--stages").arg("reconstruct,visualize");
+    // clap forbids repeated --stages, so replace the original value below.
+    let mut args: Vec<_> = cmd.get_args().map(std::ffi::OsStr::to_owned).collect();
+    let n = args.len();
+    args.truncate(n - 2);
+    if let Some(pos) = args.iter().position(|v| v == "--stages") {
+        args[pos + 1] = "reconstruct,visualize".into();
+    }
+    let mut run = Command::new(binary);
+    run.args(args).stdin(Stdio::null());
+    configure_template(
+        &mut run,
+        dataset,
+        data.contains("T1w"),
+        data.contains("T2w"),
+    )?;
+    let status = run
+        .stdout(File::create(log.join("final_pipeline.json"))?)
+        .stderr(File::create(log.join("final_pipeline.stderr.log"))?)
+        .status()?;
+    if !status.success() || !fallback::traced(dataset, id) {
+        return Err("canonical export/localization failed".into());
+    }
+    let review = qc(dataset, id)?;
+    if review["status"] != "pending_manual_review" {
+        return Err("canonical review unavailable".into());
+    }
+    atomic_json(&log.join("final_qc.json"), &review)?;
+    verify_references(dataset, id)?;
+    Ok(())
+}
+
+fn verify_references(dataset: &Path, id: &str) -> Result<()> {
+    let sub = dataset
+        .join("derivatives/leaddbs")
+        .join(format!("sub-{id}"));
+    for p in [
+        sub.join("locks/checkreg_manifest.json"),
+        sub.join("reconstruction/viz/scene_manifest.json"),
+        fallback::reconstruction(dataset, id),
+    ] {
+        let v: Value = serde_json::from_reader(File::open(p)?)?;
+        fn visit(v: &Value, root: &str) -> Result<()> {
+            match v {
+                Value::String(s) if s.starts_with(root) => {
+                    if !Path::new(s).exists() {
+                        return Err(format!("published reference missing: {s}").into());
+                    }
+                }
+                Value::Array(a) => {
+                    for v in a {
+                        visit(v, root)?
+                    }
+                }
+                Value::Object(o) => {
+                    for v in o.values() {
+                        visit(v, root)?
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        visit(&v, &dataset.to_string_lossy())?;
+    }
+    Ok(())
+}
+
+fn process(
+    source: &Path,
+    dataset: &Path,
+    binary: &Path,
+    id: &str,
+    logs: &Path,
+    max_attempts: usize,
+) -> Result<Value> {
+    let scan = dbsloc_zurich::scan_patient(source, &AtomicBool::new(false), |_| {})?;
+    let pairs = fallback::pairs(&scan, max_attempts);
+    if pairs.is_empty() {
+        return Ok(
+            json!({"subject":id,"status":"skipped","reason":"no supported MRI / metal-positive CT pair; unassigned types are not guessed","warnings":scan.warnings}),
+        );
+    }
+    let patient = logs.join(format!("sub-{id}"));
+    std::fs::create_dir(&patient)?;
+    let mut attempts = Vec::new();
+    let (success, errors) = fallback::attempt_until_success(&pairs, |n, (mri, ct)| {
+        let attempt = patient.join(format!("attempt-{:02}", n + 1));
+        std::fs::create_dir(&attempt)?;
+        let staged = attempt.join("dataset");
+        std::fs::create_dir(&staged)?;
+        let result: Result<Value> = (|| {
+            let record = process_pair(&scan, mri, ct, &staged, binary, id, &attempt)?;
+            if record["status"] != "processed_pending_review" {
+                return Err("pipeline or localization rejected scan pair".into());
+            }
+            fallback::publish(&staged, dataset, id, &attempt.join("backup"), || {
+                finalize(dataset, binary, id, &attempt)
+            })?;
+            Ok(record)
+        })();
+        let mut entry = json!({"attempt":n+1,"mri":choice(&scan.candidates[mri]),"ct":choice(&scan.candidates[ct]),"attempt_directory":attempt,"date_policy":"advisory only; selected MRI requires pre-op review"});
+        match &result {
+            Ok(_) => entry["status"] = json!("published_pending_review"),
+            Err(e) => {
+                entry["status"] = json!("failed");
+                entry["error"] = json!(e.to_string());
+                retain_qc_and_clean(&staged, &attempt)?;
+                entry["volume_artifacts_retained"] = json!(false);
+            }
+        }
+        atomic_json(&attempt.join("outcome.json"), &entry)?;
+        attempts.push(entry);
+        atomic_json(&patient.join("attempts.json"), &json!(attempts))?;
+        println!(
+            "sub-{id} attempt {}/{}: {}",
+            n + 1,
+            pairs.len(),
+            if result.is_ok() { "success" } else { "failed" }
+        );
+        result
+    });
+    let record = json!({"subject":id,"status":if success.is_some(){"processed_pending_review"}else{"failed"},"attempts":attempts,"errors":errors,"reconstruction_exists":fallback::reconstruction(dataset,id).exists(),"qc_manifest":dataset.join("derivatives/leaddbs").join(format!("sub-{id}/locks/checkreg_manifest.json")),"manual_review":"pending"});
+    atomic_json(&patient.join("status.json"), &record)?;
+    Ok(record)
+}
+
+fn retain_qc_and_clean(staged: &Path, attempt: &Path) -> Result<()> {
+    if staged != attempt.join("dataset")
+        || !attempt
+            .file_name()
+            .is_some_and(|s| s.to_string_lossy().starts_with("attempt-"))
+    {
+        return Err("refusing cleanup outside owned attempt dataset".into());
+    }
+    if staged.exists() {
+        let output = attempt.join("qc_images");
+        std::fs::create_dir_all(&output)?;
+        fn copy(dir: &Path, to: &Path) -> Result<()> {
+            for e in std::fs::read_dir(dir)? {
+                let e = e?;
+                let ty = e.file_type()?;
+                if ty.is_symlink() {
+                    return Err("symlink in owned attempt".into());
+                }
+                if ty.is_dir() {
+                    copy(&e.path(), to)?
+                } else if e.path().extension().is_some_and(|s| s == "png") {
+                    std::fs::copy(e.path(), to.join(e.file_name()))?;
+                }
+            }
+            Ok(())
+        }
+        copy(staged, &output)?;
+        std::fs::remove_dir_all(staged)?;
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.len() < 3 || (args.len() != 3 && args.len() != 5) {
+    if args.len() < 3 {
         return Err(
-            "usage: cohort SOURCE DATASET DBSLOC_BIN [--skip ID | --review-only ID]".into(),
+            "usage: cohort SOURCE DATASET DBSLOC_BIN [--skip ID] [--review-only ID] [--retry-failed] [--max-attempts N]".into(),
         );
     }
     let source = canonical(Path::new(&args[0]))?;
     let dataset = canonical(Path::new(&args[1]))?;
     let binary = canonical(Path::new(&args[2]))?;
-    if args.len() == 5 && args[3] == "--review-only" {
-        let id = args[4]
-            .to_str()
-            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-            .ok_or("review ID must contain digits only")?;
-        println!("{}", serde_json::to_string_pretty(&qc(&dataset, id)?)?);
+    let mut skip = "000003".to_owned();
+    let mut retry_failed = false;
+    let mut max_attempts = 8usize;
+    let mut review_only = None;
+    let mut k = 3;
+    while k < args.len() {
+        if args[k] == "--retry-failed" {
+            retry_failed = true;
+            k += 1;
+            continue;
+        }
+        let value = args
+            .get(k + 1)
+            .and_then(|v| v.to_str())
+            .ok_or("option needs a value")?;
+        if args[k] == "--max-attempts" {
+            max_attempts = value.parse()?;
+            if max_attempts == 0 {
+                return Err("max-attempts must be positive".into());
+            }
+        } else if args[k] == "--skip" || args[k] == "--review-only" {
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return Err("ID must contain digits only".into());
+            }
+            if args[k] == "--skip" {
+                skip = value.to_owned()
+            } else {
+                review_only = Some(value.to_owned())
+            }
+        } else {
+            return Err("unknown option".into());
+        }
+        k += 2;
+    }
+    if let Some(id) = review_only {
+        println!("{}", serde_json::to_string_pretty(&qc(&dataset, &id)?)?);
         return Ok(());
     }
-    let skip = if args.len() == 5 {
-        if args[3] != "--skip" {
-            return Err("expected --skip ID".into());
-        }
-        args[4]
-            .to_str()
-            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-            .ok_or("skip ID must contain digits only")?
-            .to_owned()
-    } else {
-        "000003".into()
-    };
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let logs = dataset
         .join("batch_logs")
@@ -277,10 +489,17 @@ fn main() -> Result<()> {
                 .join("derivatives/leaddbs")
                 .join(format!("sub-{id}"))
                 .exists();
-        let mut record = if id == "000003" || id == skip || exists {
+        let protection = fallback::protected(&dataset, &id);
+        let mut record = if let Err(e) = &protection {
+            json!({"subject":id,"status":"skipped","reason":format!("cannot verify existing approval protection: {e}")})
+        } else if id == "000003"
+            || id == skip
+            || protection.unwrap_or(true)
+            || (exists && !retry_failed)
+        {
             json!({"subject":id,"status":"skipped","reason":if id=="000003"||id==skip {"explicitly excluded"}else{"existing subject retained"}})
         } else {
-            process(&path, &dataset, &binary, &id, &logs)
+            process(&path, &dataset, &binary, &id, &logs, max_attempts)
                 .unwrap_or_else(|e| json!({"subject":id,"status":"failed","error":e.to_string()}))
         };
         record["seconds"] = json!(start.elapsed().as_secs_f64());
@@ -304,7 +523,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn candidate(session: u32, suffix: &str, quality: f32) -> Candidate {
+    pub(super) fn candidate(session: u32, suffix: &str, quality: f32) -> Candidate {
         Candidate {
             session_number: session,
             session_path: PathBuf::new(),
@@ -357,7 +576,7 @@ mod tests {
             candidate(3, "PDw", 1.),
             candidate(4, "T1w", 2.),
         ];
-        rows[1].evidence = ElectrodeEvidence::Unknown;
+        rows[1].explicit_postop = true;
         rows[2].explicit_postop = true;
         rows[3].eligible = false;
         assert!(extras(
@@ -368,6 +587,25 @@ mod tests {
             0
         )
         .is_empty());
+    }
+    #[test]
+    fn failed_attempt_cleanup_preserves_unrelated_directory() -> Result<()> {
+        let t = tempfile::tempdir()?;
+        let a = t.path().join("attempt-01");
+        std::fs::create_dir(&a)?;
+        let d = a.join("dataset");
+        std::fs::create_dir(&d)?;
+        std::fs::write(d.join("volume.nii"), "volume")?;
+        std::fs::write(d.join("qc.png"), "png")?;
+        let other = t.path().join("unrelated");
+        std::fs::create_dir(&other)?;
+        std::fs::write(other.join("keep"), "keep")?;
+        assert!(retain_qc_and_clean(&other, &a).is_err());
+        retain_qc_and_clean(&d, &a)?;
+        assert!(!d.exists());
+        assert!(a.join("qc_images/qc.png").exists());
+        assert!(other.join("keep").exists());
+        Ok(())
     }
     #[test]
     fn unattended_command_keeps_review_unapproved_and_multispectral_enabled() {
