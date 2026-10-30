@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Native Zurich patient-folder import: review suggestions for the oldest eligible pre-operative MRI and post-operative CT, with editable MRI type guesses from names and acquisition settings, convert only the selected series, then use the existing dataset import. Hospital-specific logic is isolated in `dbsloc-zurich`; source DICOM remains untouched.
+- Private-fork and upstream-update guide for maintaining local extensions.
+
 ## [0.2.0] - 2026-11-16
 
 ### Added

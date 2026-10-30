@@ -3054,6 +3054,7 @@ impl DbslocApp {
             && review_settled
             && stimulation_settled
             && group_settled
+            && self.import.as_ref().is_none_or(|wizard| !wizard.busy())
             && !self.screenshot_requested
         {
             self.screenshot_requested = true;

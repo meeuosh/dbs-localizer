@@ -6,6 +6,8 @@
 //! All rules live in [`dbsloc_pipeline::import`] (`specs/01` §8.4); this module only collects
 //! the inputs, runs the slow work on worker threads and reports the outcome.
 
+mod zurich;
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -167,6 +169,7 @@ type SubjectKey = (String, Vec<ImportItem>, Vec<PathBuf>);
 type PlanKey = (String, Option<PathBuf>, bool, bool, Vec<SubjectKey>);
 
 pub struct ImportWizard {
+    zurich: zurich::ZurichPanel,
     pub step: Step,
     pub root: String,
     pub subject: String,
@@ -449,6 +452,7 @@ impl ImportWizard {
             ),
         };
         let mut wizard = ImportWizard {
+            zurich: zurich::ZurichPanel::default(),
             step: Step::Images,
             root: root.trim().to_owned(),
             subject: String::new(),
@@ -492,6 +496,9 @@ impl ImportWizard {
         if !action.trim().eq_ignore_ascii_case("import") {
             return;
         }
+        if let Some(path) = std::env::var_os("DBSLOC_APP_IMPORT_ZURICH_PATIENT") {
+            self.scan_zurich(PathBuf::from(path), &egui::Context::default());
+        }
         if let Some(raw) = std::env::var_os("DBSLOC_APP_IMPORT_INPUTS") {
             let mut files = Vec::new();
             for p in std::env::split_paths(&raw) {
@@ -523,7 +530,7 @@ impl ImportWizard {
     }
 
     pub fn busy(&self) -> bool {
-        self.conversion.is_some() || self.import_job.is_some()
+        self.conversion.is_some() || self.import_job.is_some() || self.zurich.busy()
     }
 
     pub fn importing(&self) -> bool {
@@ -1294,6 +1301,7 @@ impl ImportWizard {
     }
 
     pub(crate) fn cancel_job(&mut self) {
+        self.zurich.cancel();
         self.dicom_queue.clear();
         if let Some(j) = &self.conversion {
             j.cancel.store(true, Ordering::SeqCst);
@@ -1340,6 +1348,7 @@ impl ImportWizard {
     }
 
     pub fn poll(&mut self, ctx: &egui::Context) {
+        self.poll_zurich(ctx);
         self.poll_pick(ctx);
         self.poll_conversion(ctx);
         self.poll_import();
@@ -1669,6 +1678,10 @@ impl ImportWizard {
     }
 
     fn images_step(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.zurich_ui(ui, ctx);
+        if self.zurich.reviewing() {
+            return;
+        }
         let unit = em(ui);
         let pal = palette(ui);
         ui.horizontal(|ui| {

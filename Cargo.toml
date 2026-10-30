@@ -20,6 +20,7 @@ members = [
     "crates/dbsloc-vat",
     "crates/dbsloc-reports",
     "crates/dbsloc-checkreg",
+    "crates/dbsloc-zurich",
 ]
 
 [workspace.package]
