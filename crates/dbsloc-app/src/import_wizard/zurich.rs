@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Wyss Center for Bio and Neuroengineering
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Hospital-folder discovery stays outside the ordinary image import path.
 
 use super::*;
@@ -630,7 +633,7 @@ mod tests {
             let ctx = egui::Context::default();
             let mut action_visible = false;
             for _ in 0..3 {
-                let output = ctx.run_ui(
+                let mut output = ctx.run_ui(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
                         ..Default::default()
@@ -644,6 +647,7 @@ mod tests {
                     matches!(&clipped.shape, egui::Shape::Text(text) if text.galley.job.text == "Use selected scans")
                         && clipped.clip_rect.contains_rect(clipped.shape.visual_bounding_rect())
                 });
+                output.textures_delta.clear();
             }
             assert!(action_visible, "Use selected scans clipped at {size:?}");
         }

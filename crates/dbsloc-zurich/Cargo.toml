@@ -1,11 +1,13 @@
 [package]
 name = "dbsloc-zurich"
 version.workspace = true
+publish = false
 edition = "2021"
 description = "Isolated Zurich hospital-folder triage and reviewed import adapter"
+license = "GPL-3.0-only"
 
 [dependencies]
-dbsloc-pipeline = { path = "../dbsloc-pipeline" }
+dbsloc-pipeline = { path = "../dbsloc-pipeline", default-features = false }
 dicom-object = "0.7"
 dicom-dictionary-std = "0.7"
 dicom-pixeldata = { version = "0.7", default-features = false, features = ["native"] }

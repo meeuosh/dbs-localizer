@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Wyss Center for Bio and Neuroengineering
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Explicitly authorized unattended workflow; specs/17 §6.
 use std::collections::BTreeMap;
 use std::error::Error;

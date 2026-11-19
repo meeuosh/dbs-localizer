@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Wyss Center for Bio and Neuroengineering
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Local verification helper; never prints identifying DICOM metadata.
 use std::io::Write;
 use std::path::PathBuf;

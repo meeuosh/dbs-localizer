@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Wyss Center for Bio and Neuroengineering
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Zurich-specific triage; final BIDS writes belong to `dbsloc_pipeline::import`.
 
 mod prepare;
