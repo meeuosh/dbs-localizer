@@ -24,7 +24,7 @@ fn canonical(path: &Path) -> Result<PathBuf> {
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err("parent traversal is not allowed".into());
     }
-    Ok(std::fs::canonicalize(path)?)
+    Ok(dbsloc_zurich::canonical_path(path)?)
 }
 
 fn subject(name: &str) -> Option<&str> {

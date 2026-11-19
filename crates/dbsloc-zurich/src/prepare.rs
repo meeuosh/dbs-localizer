@@ -188,7 +188,7 @@ pub fn prepare_selection(
     let parent = output
         .parent()
         .ok_or(Error::Selection("temporary output needs a parent"))?;
-    let parent = std::fs::canonicalize(parent).map_err(|e| io("open temporary parent", e))?;
+    let parent = crate::canonical_path(parent).map_err(|e| io("open temporary parent", e))?;
     let name = output
         .file_name()
         .ok_or(Error::Selection("temporary output needs a directory name"))?;

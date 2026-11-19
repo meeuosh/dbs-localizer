@@ -740,7 +740,7 @@ pub fn scan_patient(
 ) -> Result<Scan, Error> {
     check_cancel(cancel)?;
     reject_traversal(path)?;
-    let root = std::fs::canonicalize(path).map_err(|e| io("open patient directory", e))?;
+    let root = crate::canonical_path(path).map_err(|e| io("open patient directory", e))?;
     let mut sessions = Vec::new();
     for (dir, ty) in children(&root)? {
         if !ty.is_dir() {

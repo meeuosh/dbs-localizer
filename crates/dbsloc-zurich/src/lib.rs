@@ -134,3 +134,53 @@ fn reject_traversal(path: &std::path::Path) -> Result<(), Error> {
         Ok(())
     }
 }
+
+/// Canonicalize `path` and, on Windows, strip the `\\?\` verbatim prefix so external tools
+/// such as `dcm2niix.exe` and `dbsloc.exe` receive standard drive or UNC paths.
+pub fn canonical_path(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)?;
+    #[cfg(windows)]
+    {
+        if let Some(stripped) = canonical.to_str().and_then(strip_windows_verbatim_str) {
+            return Ok(PathBuf::from(stripped));
+        }
+    }
+    Ok(canonical)
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn strip_windows_verbatim_str(raw: &str) -> Option<String> {
+    if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        return Some(format!(r"\\{unc}"));
+    }
+    let rest = raw.strip_prefix(r"\\?\")?;
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return Some(rest.to_owned());
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_windows_verbatim_str;
+
+    #[test]
+    fn strips_windows_verbatim_drive_and_unc_prefixes() {
+        assert_eq!(
+            strip_windows_verbatim_str(r"\\?\C:\Users\milosz\Temp\stage_0").as_deref(),
+            Some(r"C:\Users\milosz\Temp\stage_0")
+        );
+        assert_eq!(
+            strip_windows_verbatim_str(r"\\?\UNC\server\share\zurich\pt01").as_deref(),
+            Some(r"\\server\share\zurich\pt01")
+        );
+        assert_eq!(strip_windows_verbatim_str(r"C:\plain\path"), None);
+        assert_eq!(strip_windows_verbatim_str("/tmp/linux/path"), None);
+        assert_eq!(strip_windows_verbatim_str(r"\\?\Volume{1234}\foo"), None);
+    }
+}

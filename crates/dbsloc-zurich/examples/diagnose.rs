@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if source.components().any(|c| c == Component::ParentDir) {
         return Err("parent traversal is not allowed".into());
     }
-    let source = source.canonicalize()?;
+    let source = dbsloc_zurich::canonical_path(source)?;
     let scan = dbsloc_zurich::scan_patient(&source, &AtomicBool::new(false), |_| {})?;
     let candidates: Vec<_> = scan.candidates.iter().enumerate().map(|(index, c)| {
         let positions: Vec<_> = c.slices.iter().filter_map(|s|s.position).collect();
