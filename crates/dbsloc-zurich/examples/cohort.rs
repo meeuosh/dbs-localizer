@@ -546,6 +546,10 @@ mod tests {
             quality,
             explicit_preop: true,
             explicit_postop: false,
+            ct_kernel: dbsloc_zurich::CtKernel::Unknown,
+            orientation: None,
+            contrast_source: dbsloc_zurich::ContrastSource::DicomText,
+            telemetry: dbsloc_zurich::ArtifactTelemetry::default(),
         }
     }
     #[test]

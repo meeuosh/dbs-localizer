@@ -3,13 +3,84 @@
 
 //! Zurich-specific triage; final BIDS writes belong to `dbsloc_pipeline::import`.
 
+mod debug_report;
+mod fallback;
 mod prepare;
 mod scan;
 
 use std::path::PathBuf;
 
-pub use prepare::prepare_selection;
+pub use debug_report::build_debug_report;
+pub use prepare::{prepare_selection, prepare_study, PreparedStudyItem};
 pub use scan::scan_patient;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CtKernel {
+    SoftTissue,
+    #[default]
+    Unknown,
+    Bone,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcqOrientation {
+    Iso,
+    Ax,
+    Cor,
+    Sag,
+}
+
+impl AcqOrientation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Iso => "iso",
+            Self::Ax => "ax",
+            Self::Cor => "cor",
+            Self::Sag => "sag",
+        }
+    }
+
+    pub fn to_import_acq(self) -> dbsloc_pipeline::import::Acq {
+        match self {
+            Self::Iso => dbsloc_pipeline::import::Acq::Iso,
+            Self::Ax => dbsloc_pipeline::import::Acq::Ax,
+            Self::Cor => dbsloc_pipeline::import::Acq::Cor,
+            Self::Sag => dbsloc_pipeline::import::Acq::Sag,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContrastSource {
+    DicomText,
+    DicomPhysics,
+    SidecarPhysics,
+    ImageIntensity,
+    Manual,
+    #[default]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ArtifactTelemetry {
+    pub sampled_slices: usize,
+    pub positive_slices: usize,
+    pub intracranial_metal_counts: Vec<usize>,
+    pub max_hu: f32,
+    pub used_intracranial_mask: bool,
+    pub mr_void_slices: usize,
+    pub mr_void_counts: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct IntensityStats {
+    pub brain_median: f32,
+    pub p90_ratio: f32,
+    pub p99_ratio: f32,
+    pub core_bright_ratio: f32,
+    pub core_dark_ratio: f32,
+    pub rim_to_median: f32,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Modality {
@@ -52,6 +123,10 @@ pub struct Candidate {
     pub quality: f32,
     pub explicit_preop: bool,
     pub explicit_postop: bool,
+    pub ct_kernel: CtKernel,
+    pub orientation: Option<AcqOrientation>,
+    pub contrast_source: ContrastSource,
+    pub telemetry: ArtifactTelemetry,
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +146,9 @@ pub struct Slice {
 pub struct Scan {
     pub candidates: Vec<Candidate>,
     pub preop_mri: Option<usize>,
+    /// All eligible anatomical MR series from the chosen most-recent clean MR study
+    /// (primary T1w first when available).
+    pub preop_mris: Vec<usize>,
     pub postop_ct: Option<usize>,
     pub warnings: Vec<String>,
 }

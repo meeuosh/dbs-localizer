@@ -11,8 +11,8 @@ use dicom_pixeldata::PixelDecoder;
 use rayon::prelude::*;
 
 use crate::{
-    check_cancel, io, reject_traversal, Candidate, ElectrodeEvidence, Error, Modality, Preview,
-    Progress, Scan, Slice,
+    check_cancel, io, reject_traversal, AcqOrientation, ArtifactTelemetry, Candidate,
+    ContrastSource, CtKernel, ElectrodeEvidence, Error, Modality, Preview, Progress, Scan, Slice,
 };
 
 fn session_number(name: &str) -> Option<u32> {
@@ -132,6 +132,7 @@ struct Header {
     description: String,
     protocol: String,
     image_type: String,
+    kernel: String,
     date: Option<String>,
     acquisition: Acquisition,
     slice: Slice,
@@ -171,6 +172,7 @@ fn header(path: &Path, hint: Modality) -> Option<Header> {
             text(&obj, tags::SEQUENCE_NAME)
         ),
         image_type: text(&obj, tags::IMAGE_TYPE),
+        kernel: text(&obj, tags::CONVOLUTION_KERNEL),
         date,
         acquisition: Acquisition::read(&obj),
         slice: Slice {
@@ -451,6 +453,47 @@ fn infer_suffix(label: &str, a: &Acquisition) -> (Option<String>, String) {
     }
 }
 
+fn classify_ct_kernel(kernel: &str, label: &str) -> CtKernel {
+    let combined = format!("{kernel} {label}").to_lowercase();
+    let bone_tokens = [
+        "bone", "knochen", "osteo", "sharp", "h60", "h70", "h80", "j70", "hr60", "hr68", "hr70",
+        "qr60", "fc30", "fc80", "fc81", "yc", "yd",
+    ];
+    let soft_tokens = [
+        "soft", "brain", "hirn", "cerebr", "standard", "std", "smooth", "h20", "h30", "h31", "h40",
+        "j30", "j40", "hr36", "hr40", "qr40", "fc21", "fc23", "fc26", "ub", "ua",
+    ];
+    if any(&combined, &bone_tokens) {
+        CtKernel::Bone
+    } else if any(&combined, &soft_tokens) {
+        CtKernel::SoftTissue
+    } else {
+        CtKernel::Unknown
+    }
+}
+
+fn infer_orientation(orientation: Option<[f64; 6]>, spacing: [f32; 3]) -> Option<AcqOrientation> {
+    if !spacing.iter().all(|s| s.is_finite() && *s > 0.0) {
+        return None;
+    }
+    let min_s = spacing[0].min(spacing[1]).min(spacing[2]);
+    let max_s = spacing[0].max(spacing[1]).max(spacing[2]);
+    if max_s / min_s <= 1.25 {
+        return Some(AcqOrientation::Iso);
+    }
+    let o = orientation?;
+    let nx = (o[1] * o[5] - o[2] * o[4]).abs();
+    let ny = (o[2] * o[3] - o[0] * o[5]).abs();
+    let nz = (o[0] * o[4] - o[1] * o[3]).abs();
+    if nz >= nx && nz >= ny {
+        Some(AcqOrientation::Ax)
+    } else if ny >= nx {
+        Some(AcqOrientation::Cor)
+    } else {
+        Some(AcqOrientation::Sag)
+    }
+}
+
 fn build(mut headers: Vec<Header>, session_number: u32, session_path: PathBuf) -> Candidate {
     let mut seen = std::collections::HashSet::new();
     headers.retain(|h| h.sop_uid.is_empty() || seen.insert(h.sop_uid.clone()));
@@ -490,8 +533,6 @@ fn build(mut headers: Vec<Header>, session_number: u32, session_path: PathBuf) -
                 "save_screen",
                 "mip",
                 "minip",
-                "bone",
-                "knochen",
             ],
         );
     let mut consistent = headers.iter().all(|h| {
@@ -536,14 +577,31 @@ fn build(mut headers: Vec<Header>, session_number: u32, session_path: PathBuf) -
         .filter(|z| *z > 0.)
         .unwrap_or(first.slice.thickness);
     let spacing = [first.slice.spacing[1], first.slice.spacing[0], z];
-    let (recognized, suffix_reason) = if first.modality == Modality::Ct {
+    let (recognized, suffix_reason, contrast_source) = if first.modality == Modality::Ct {
         (
             Some("CT".into()),
             "CT modality from DICOM tag or recognized CT folder".into(),
+            ContrastSource::DicomText,
         )
     } else {
-        infer_suffix(&label, &first.acquisition)
+        let (s, r) = infer_suffix(&label, &first.acquisition);
+        let src = if s.is_some() {
+            if named_suffix(&label).is_some() {
+                ContrastSource::DicomText
+            } else {
+                ContrastSource::DicomPhysics
+            }
+        } else {
+            ContrastSource::Unknown
+        };
+        (s, r, src)
     };
+    let ct_kernel = if first.modality == Modality::Ct {
+        classify_ct_kernel(&first.kernel, &label)
+    } else {
+        CtKernel::Unknown
+    };
+    let acq_orientation = infer_orientation(orientation, spacing);
     let eligible = !scout && consistent && spacing.iter().all(|s| s.is_finite() && *s > 0.);
     let post = any(
         &label,
@@ -591,8 +649,191 @@ fn build(mut headers: Vec<Header>, session_number: u32, session_path: PathBuf) -
         quality: 1. / z.max(0.1) + headers.len().min(500) as f32 / 500.,
         explicit_preop: pre,
         explicit_postop: post,
+        ct_kernel,
+        orientation: acq_orientation,
+        contrast_source,
+        telemetry: ArtifactTelemetry::default(),
         slices: headers.into_iter().map(|h| h.slice).collect(),
     }
+}
+
+/// Count metal pixels (>= 2500 HU) strictly inside the intracranial cavity on a 2D axial CT slice.
+/// Returns `(metal_count, max_hu_in_roi, used_intracranial_mask)`.
+///
+/// Finds the skull bone ring (>= 300 HU) row-by-row and col-by-col and erodes inward by ~8 mm
+/// so stereotactic frame pins, skull bolts, and ear/dental hardware outside the skull are ignored.
+/// Falls back to the central 50% x 50% ROI only when no skull ring is present (e.g. skull-less
+/// synthetic phantoms).
+fn count_ct_intracranial_metal(p: &Preview, spacing_mm: [f32; 2]) -> (usize, f32, bool) {
+    let w = p.width;
+    let h = p.height;
+    if w < 8 || h < 8 || p.pixels.len() < w * h {
+        return (0, 0.0, false);
+    }
+
+    // Detect skull ring bounds per row and per column (cortical bone >= 300 HU).
+    let mut row_bounds: Vec<Option<(usize, usize)>> = vec![None; h];
+    let mut col_bounds: Vec<Option<(usize, usize)>> = vec![None; w];
+    let mut bone_rows = 0usize;
+    for (y, rb) in row_bounds.iter_mut().enumerate() {
+        let mut min_x = None;
+        let mut max_x = 0usize;
+        for x in 0..w {
+            let v = p.pixels[y * w + x];
+            if v >= 300.0 {
+                if min_x.is_none() {
+                    min_x = Some(x);
+                }
+                max_x = x;
+            }
+        }
+        if let Some(lo) = min_x {
+            if max_x > lo + (w / 6).max(4) {
+                *rb = Some((lo, max_x));
+                bone_rows += 1;
+            }
+        }
+    }
+    for (x, cb) in col_bounds.iter_mut().enumerate() {
+        let mut min_y = None;
+        let mut max_y = 0usize;
+        for y in 0..h {
+            let v = p.pixels[y * w + x];
+            if v >= 300.0 {
+                if min_y.is_none() {
+                    min_y = Some(y);
+                }
+                max_y = y;
+            }
+        }
+        if let Some(lo) = min_y {
+            if max_y > lo + (h / 6).max(4) {
+                *cb = Some((lo, max_y));
+            }
+        }
+    }
+
+    let use_skull_mask = bone_rows >= (h / 6).max(4);
+    let px_mm = spacing_mm[0].max(spacing_mm[1]).clamp(0.25, 4.0);
+    let margin = ((8.0 / px_mm).round() as usize).clamp(3, (w.min(h) / 8).max(3));
+
+    let mut metal = 0usize;
+    let mut max_hu = f32::NEG_INFINITY;
+
+    if use_skull_mask {
+        for (y, rb) in row_bounds
+            .iter()
+            .enumerate()
+            .take(h.saturating_sub(margin))
+            .skip(margin)
+        {
+            let Some((x_lo, x_hi)) = *rb else {
+                continue;
+            };
+            let start_x = x_lo + margin;
+            let end_x = x_hi.saturating_sub(margin);
+            if start_x >= end_x {
+                continue;
+            }
+            for (x, cb) in col_bounds.iter().enumerate().take(end_x + 1).skip(start_x) {
+                let Some((y_lo, y_hi)) = *cb else {
+                    continue;
+                };
+                if y < y_lo + margin || y > y_hi.saturating_sub(margin) {
+                    continue;
+                }
+                let v = p.pixels[y * w + x];
+                if v > max_hu {
+                    max_hu = v;
+                }
+                if v >= 2500.0 {
+                    metal += 1;
+                }
+            }
+        }
+    } else {
+        for y in h / 4..h * 3 / 4 {
+            for x in w / 4..w * 3 / 4 {
+                let v = p.pixels[y * w + x];
+                if v > max_hu {
+                    max_hu = v;
+                }
+                if v >= 2500.0 {
+                    metal += 1;
+                }
+            }
+        }
+    }
+
+    if !max_hu.is_finite() {
+        max_hu = 0.0;
+    }
+    (metal, max_hu, use_skull_mask)
+}
+
+/// Detect compact dark susceptibility voids inside bright brain parenchyma on a 2D MR slice.
+/// Returns the count of deep-parenchyma dark-void pixels embedded inside bright brain tissue.
+fn count_mr_susceptibility_voids(p: &Preview) -> usize {
+    let w = p.width;
+    let h = p.height;
+    if w < 16 || h < 16 || p.pixels.len() < w * h {
+        return 0;
+    }
+    let mut vals: Vec<f32> = Vec::with_capacity((w * h) / 4);
+    for y in h / 4..h * 3 / 4 {
+        for x in w / 4..w * 3 / 4 {
+            let v = p.pixels[y * w + x];
+            if v.is_finite() && v > 0.0 {
+                vals.push(v);
+            }
+        }
+    }
+    if vals.len() < 32 {
+        return 0;
+    }
+    vals.sort_by(f32::total_cmp);
+    let p95 = vals[((vals.len() - 1) as f32 * 0.95) as usize];
+    let floor = p95 * 0.15;
+    vals.retain(|&v| v > floor);
+    if vals.len() < 32 {
+        return 0;
+    }
+    let brain_median = vals[vals.len() / 2];
+    if brain_median <= 0.0 {
+        return 0;
+    }
+    let dark_thresh = brain_median * 0.08;
+    let bright_ring = brain_median * 0.60;
+    let r = (w.min(h) / 32).clamp(2, 6);
+
+    // Search lateral deep-brain parenchyma (avoiding outer scalp and central midline ventricles).
+    let mid_x = w / 2;
+    let mid_band = (w / 14).max(2);
+    let mut void_px = 0usize;
+    for y in (h * 3 / 10)..(h * 7 / 10) {
+        for x in (w * 3 / 10)..(w * 7 / 10) {
+            if x.abs_diff(mid_x) < mid_band {
+                continue;
+            }
+            let v = p.pixels[y * w + x];
+            if v > dark_thresh {
+                continue;
+            }
+            // Must be surrounded on all 4 cardinal sides by bright brain parenchyma.
+            if x >= r
+                && x + r < w
+                && y >= r
+                && y + r < h
+                && p.pixels[y * w + (x - r)] >= bright_ring
+                && p.pixels[y * w + (x + r)] >= bright_ring
+                && p.pixels[(y - r) * w + x] >= bright_ring
+                && p.pixels[(y + r) * w + x] >= bright_ring
+            {
+                void_px += 1;
+            }
+        }
+    }
+    void_px
 }
 
 fn evidence(candidate: &mut Candidate, cancel: &AtomicBool) -> Result<(), Error> {
@@ -605,6 +846,48 @@ fn evidence(candidate: &mut Candidate, cancel: &AtomicBool) -> Result<(), Error>
         return Ok(());
     }
     if candidate.modality == Modality::Mr {
+        if candidate.explicit_postop {
+            candidate.evidence = ElectrodeEvidence::Detected;
+            candidate.reason =
+                "Post-op/DBS metadata; keyword evidence only, review required".into();
+            return Ok(());
+        }
+        // Fast 5-slice MR susceptibility-void screen across middle brain slabs.
+        let mut indices: Vec<usize> = [0.40, 0.48, 0.56, 0.64, 0.72]
+            .into_iter()
+            .map(|f| ((candidate.slices.len() - 1) as f64 * f).round() as usize)
+            .collect();
+        indices.dedup();
+        let mut void_slices = 0usize;
+        let mut void_counts = Vec::with_capacity(indices.len());
+        for i in indices {
+            check_cancel(cancel)?;
+            let p = if i == candidate.slices.len() / 2 {
+                candidate.preview.clone()
+            } else {
+                preview(&candidate.slices[i])
+            };
+            let count = p.as_ref().map(count_mr_susceptibility_voids).unwrap_or(0);
+            void_counts.push(count);
+            if (4..=300).contains(&count) {
+                void_slices += 1;
+            }
+        }
+        candidate.telemetry.sampled_slices = void_counts.len();
+        candidate.telemetry.mr_void_slices = void_slices;
+        candidate.telemetry.mr_void_counts = void_counts;
+        if void_slices >= 2 {
+            candidate.evidence = ElectrodeEvidence::Detected;
+            candidate.reason = format!(
+                "Compact deep-brain MR signal voids on {void_slices}/{} slices; possible electrode artifact",
+                candidate.telemetry.sampled_slices
+            );
+        } else {
+            candidate.evidence = ElectrodeEvidence::LikelyAbsent;
+            candidate.reason =
+                "No post-op keywords or deep-brain susceptibility voids found; review visually"
+                    .into();
+        }
         return Ok(());
     }
     let axial = candidate.slices.iter().all(|s| {
@@ -630,8 +913,12 @@ fn evidence(candidate: &mut Candidate, cancel: &AtomicBool) -> Result<(), Error>
         .map(|f| superior[((candidate.slices.len() - 1) as f64 * f).round() as usize])
         .collect();
     indices.dedup();
-    let mut positive = 0;
-    let mut failed = 0;
+    let mut positive = 0usize;
+    let mut failed = 0usize;
+    let mut counts = Vec::with_capacity(indices.len());
+    let mut max_hu = 0.0f32;
+    let mut used_mask = false;
+    let in_plane = [candidate.spacing_mm[0], candidate.spacing_mm[1]];
     for i in indices {
         check_cancel(cancel)?;
         let p = if i == candidate.slices.len() / 2 {
@@ -643,44 +930,72 @@ fn evidence(candidate: &mut Candidate, cancel: &AtomicBool) -> Result<(), Error>
             failed += 1;
             continue;
         };
-        let mut metal = 0;
-        for y in p.height / 4..p.height * 3 / 4 {
-            for x in p.width / 4..p.width * 3 / 4 {
-                if p.pixels[y * p.width + x] >= 2500. {
-                    metal += 1;
-                }
-            }
+        let (metal, slice_max, masked) = count_ct_intracranial_metal(&p, in_plane);
+        counts.push(metal);
+        if slice_max > max_hu {
+            max_hu = slice_max;
         }
+        used_mask |= masked;
         if (2..=450).contains(&metal) {
             positive += 1;
         }
     }
+    candidate.telemetry.sampled_slices = counts.len();
+    candidate.telemetry.positive_slices = positive;
+    candidate.telemetry.intracranial_metal_counts = counts;
+    candidate.telemetry.max_hu = max_hu;
+    candidate.telemetry.used_intracranial_mask = used_mask;
     if failed > 0 {
         candidate.reason =
             "One or more sampled CT slices could not be decoded; evidence unknown".into();
     } else if positive >= 2 {
         candidate.evidence = ElectrodeEvidence::Detected;
         candidate.reason = format!(
-            "Metal-like central clusters on {positive}/5 CT samples (>=2500 HU); review required"
+            "Intracranial metal clusters on {positive}/{} CT samples (>=2500 HU, max {max_hu:.0} HU, skull_mask={used_mask}); review required",
+            candidate.telemetry.sampled_slices
         );
     } else {
         candidate.evidence = ElectrodeEvidence::LikelyAbsent;
         candidate.reason =
-            "Sparse CT sampling found no consistent metal signature; absence is not proven".into();
+            "Sparse intracranial CT sampling found no consistent metal signature; absence is not proven".into();
     }
     Ok(())
 }
 
+fn ct_kernel_rank(k: CtKernel) -> u8 {
+    match k {
+        CtKernel::SoftTissue => 0,
+        CtKernel::Unknown => 1,
+        CtKernel::Bone => 2,
+    }
+}
+
+fn ct_orient_rank(o: Option<AcqOrientation>) -> u8 {
+    match o {
+        Some(AcqOrientation::Ax | AcqOrientation::Iso) => 0,
+        None => 1,
+        Some(AcqOrientation::Cor | AcqOrientation::Sag) => 2,
+    }
+}
+
+fn mr_contrast_rank(suffix: Option<&str>) -> u8 {
+    match suffix {
+        Some("T1w") => 0,
+        Some("T2w") => 1,
+        Some("FGATIR") => 2,
+        Some("FLAIR") => 3,
+        Some("PDw") => 4,
+        Some(_) => 5,
+        None => 6,
+    }
+}
+
+/// Select the oldest electrode-positive CT study (1 best-quality scan, preferring soft-tissue
+/// kernel over bone kernel) and the **most recent** artifact-free MR study (all eligible
+/// anatomical MR series). Randomized DICOM `StudyDate` values are intentionally ignored;
+/// `export-001` is newest and higher numbers are older.
 pub(crate) fn recommend(scan: &mut Scan) {
-    let first_ct = scan
-        .candidates
-        .iter()
-        .filter(|c| {
-            c.eligible && c.modality == Modality::Ct && c.evidence == ElectrodeEvidence::Detected
-        })
-        .filter_map(|c| c.study_date.as_ref())
-        .min()
-        .cloned();
+    // 1. Ensure MR evidence reflects explicit post-op / void detection without using StudyDate.
     for c in &mut scan.candidates {
         if c.modality != Modality::Mr || !c.eligible {
             continue;
@@ -688,49 +1003,107 @@ pub(crate) fn recommend(scan: &mut Scan) {
         if c.explicit_postop {
             c.evidence = ElectrodeEvidence::Detected;
             c.reason = "Post-op/DBS metadata; keyword evidence only, review required".into();
-        } else if c
-            .study_date
-            .as_ref()
-            .zip(first_ct.as_ref())
-            .is_some_and(|(m, ct)| m >= ct)
-        {
-            c.evidence = ElectrodeEvidence::Unknown;
-            c.reason =
-                "MRI acquired on/after earliest metal-positive CT; cannot suggest pre-op".into();
-        } else if c
-            .study_date
-            .as_ref()
-            .zip(first_ct.as_ref())
-            .is_some_and(|(m, ct)| m < ct)
-        {
+        } else if c.evidence == ElectrodeEvidence::Unknown {
             c.evidence = ElectrodeEvidence::LikelyAbsent;
-            c.reason="MRI predates earliest metal-positive CT; chronological suggestion, review required".into();
-        } else if c.explicit_preop {
-            c.evidence = ElectrodeEvidence::LikelyAbsent;
-            c.reason = "Explicit pre-op metadata; electrode absence is not proven".into();
+            c.reason = "No post-op keywords or artifact detected; review visually".into();
         }
     }
-    let choose = |modality, evidence| {
+
+    // 2. CT: oldest export (max session_number) with at least one electrode-positive CT series.
+    // Within that export pick the single best CT: axial/iso, thin slices (<=1.25mm),
+    // soft-tissue kernel over bone kernel, highest quality.
+    let oldest_ct_session = scan
+        .candidates
+        .iter()
+        .filter(|c| {
+            c.modality == Modality::Ct
+                && c.eligible
+                && c.evidence == ElectrodeEvidence::Detected
+                && c.suffix.is_some()
+        })
+        .map(|c| c.session_number)
+        .max();
+
+    scan.postop_ct = oldest_ct_session.and_then(|sess| {
         scan.candidates
             .iter()
             .enumerate()
             .filter(|(_, c)| {
-                c.modality == modality && c.eligible && c.evidence == evidence && c.suffix.is_some()
+                c.modality == Modality::Ct
+                    && c.session_number == sess
+                    && c.eligible
+                    && c.evidence == ElectrodeEvidence::Detected
+                    && c.suffix.is_some()
             })
             .min_by(|(_, a), (_, b)| {
-                b.session_number
-                    .cmp(&a.session_number)
-                    .then_with(|| {
-                        (b.suffix.as_deref() == Some("T1w"))
-                            .cmp(&(a.suffix.as_deref() == Some("T1w")))
-                    })
+                ct_orient_rank(a.orientation)
+                    .cmp(&ct_orient_rank(b.orientation))
+                    .then_with(|| (a.spacing_mm[2] > 1.25).cmp(&(b.spacing_mm[2] > 1.25)))
+                    .then_with(|| ct_kernel_rank(a.ct_kernel).cmp(&ct_kernel_rank(b.ct_kernel)))
                     .then_with(|| b.quality.total_cmp(&a.quality))
                     .then_with(|| a.series_uid.cmp(&b.series_uid))
             })
             .map(|(i, _)| i)
-    };
-    scan.preop_mri = choose(Modality::Mr, ElectrodeEvidence::LikelyAbsent);
-    scan.postop_ct = choose(Modality::Ct, ElectrodeEvidence::Detected);
+    });
+
+    // 3. MR: most recent export (min session_number, closest to export-001) that has NO
+    // electrode-positive MR series and at least one eligible anatomical MR series.
+    let mut mr_sessions: Vec<u32> = scan
+        .candidates
+        .iter()
+        .filter(|c| c.modality == Modality::Mr && c.eligible)
+        .map(|c| c.session_number)
+        .collect();
+    mr_sessions.sort_unstable();
+    mr_sessions.dedup();
+
+    let chosen_mr_session = mr_sessions.into_iter().find(|&sess| {
+        let has_artifact = scan.candidates.iter().any(|c| {
+            c.modality == Modality::Mr
+                && c.session_number == sess
+                && c.eligible
+                && c.evidence == ElectrodeEvidence::Detected
+        });
+        let has_clean_mr = scan.candidates.iter().any(|c| {
+            c.modality == Modality::Mr
+                && c.session_number == sess
+                && c.eligible
+                && c.evidence == ElectrodeEvidence::LikelyAbsent
+        });
+        !has_artifact && has_clean_mr
+    });
+
+    if let Some(sess) = chosen_mr_session {
+        let mut mris: Vec<usize> = scan
+            .candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                c.modality == Modality::Mr
+                    && c.session_number == sess
+                    && c.eligible
+                    && c.evidence == ElectrodeEvidence::LikelyAbsent
+            })
+            .map(|(i, _)| i)
+            .collect();
+        mris.sort_by(|&ia, &ib| {
+            let a = &scan.candidates[ia];
+            let b = &scan.candidates[ib];
+            mr_contrast_rank(a.suffix.as_deref())
+                .cmp(&mr_contrast_rank(b.suffix.as_deref()))
+                .then_with(|| {
+                    (a.orientation != Some(AcqOrientation::Iso))
+                        .cmp(&(b.orientation != Some(AcqOrientation::Iso)))
+                })
+                .then_with(|| b.quality.total_cmp(&a.quality))
+                .then_with(|| a.series_uid.cmp(&b.series_uid))
+        });
+        scan.preop_mri = mris.first().copied();
+        scan.preop_mris = mris;
+    } else {
+        scan.preop_mri = None;
+        scan.preop_mris.clear();
+    }
 }
 
 pub fn scan_patient(
@@ -973,7 +1346,7 @@ mod tests {
         assert_eq!(scan.candidates.len(), 3);
         assert!(scan.candidates.iter().all(|c| c.slice_count == 20));
         let m = &scan.candidates[scan.preop_mri.ok_or("missing MRI suggestion")?];
-        assert_eq!(m.session_number, 10);
+        assert_eq!(m.session_number, 1);
         assert_eq!(
             m.preview.as_ref().ok_or("missing preview")?.pixels[0],
             1976.
@@ -1150,46 +1523,118 @@ mod tests {
             quality: 1.,
             explicit_preop: m == Modality::Mr,
             explicit_postop: false,
+            ct_kernel: CtKernel::Unknown,
+            orientation: Some(AcqOrientation::Iso),
+            contrast_source: ContrastSource::DicomText,
+            telemetry: ArtifactTelemetry::default(),
         }
     }
     #[test]
-    fn oldest_wins_over_quality_and_uid_breaks_ties() {
-        let mut old = candidate(10, "z", Modality::Mr, ElectrodeEvidence::LikelyAbsent);
-        old.quality = 0.;
-        let mut newer = candidate(2, "a", Modality::Mr, ElectrodeEvidence::LikelyAbsent);
-        newer.quality = 100.;
+    fn newest_clean_mr_and_oldest_positive_ct_selected() {
+        // MR/export-001 has post-op artifact -> skipped; MR/export-002 is newest clean study
+        // (preferred over older MR/export-010) and collects all anatomical series in export-002.
+        let postop_mr = candidate(1, "post", Modality::Mr, ElectrodeEvidence::Detected);
+        let mut t1_new = candidate(2, "t1", Modality::Mr, ElectrodeEvidence::LikelyAbsent);
+        t1_new.suffix = Some("T1w".into());
+        let mut t2_new = candidate(2, "t2", Modality::Mr, ElectrodeEvidence::LikelyAbsent);
+        t2_new.suffix = Some("T2w".into());
+        let old_mr = candidate(10, "old", Modality::Mr, ElectrodeEvidence::LikelyAbsent);
+        let ct_new = candidate(1, "ct1", Modality::Ct, ElectrodeEvidence::Detected);
+        let ct_old = candidate(4, "ct4", Modality::Ct, ElectrodeEvidence::Detected);
         let mut scan = Scan {
-            candidates: vec![
-                newer,
-                old,
-                candidate(10, "a", Modality::Mr, ElectrodeEvidence::LikelyAbsent),
-                candidate(1, "x", Modality::Ct, ElectrodeEvidence::Detected),
-            ],
+            candidates: vec![postop_mr, t2_new, t1_new, old_mr, ct_new, ct_old],
             ..Scan::default()
         };
         recommend(&mut scan);
         assert_eq!(scan.preop_mri, Some(2));
-        assert_eq!(scan.postop_ct, Some(3));
+        assert_eq!(scan.preop_mris, vec![2, 1]);
+        assert_eq!(scan.postop_ct, Some(5));
     }
     #[test]
-    fn unknown_is_not_negative_and_dates_override_preop_keyword() {
-        let mut m = candidate(3, "m", Modality::Mr, ElectrodeEvidence::Unknown);
-        m.study_date = Some("20250103".into());
+    fn randomized_study_dates_are_ignored_for_mr_selection() {
+        let mut m = candidate(2, "m", Modality::Mr, ElectrodeEvidence::Unknown);
+        // Even if randomized StudyDate is after CT's StudyDate, export numbering + artifact rules apply.
+        m.study_date = Some("20990103".into());
         let mut ct = candidate(2, "ct", Modality::Ct, ElectrodeEvidence::Detected);
-        ct.study_date = Some("20250102".into());
+        ct.study_date = Some("20200102".into());
         let mut scan = Scan {
             candidates: vec![m, ct],
             ..Scan::default()
         };
         recommend(&mut scan);
-        assert_eq!(scan.preop_mri, None);
-        assert_eq!(scan.candidates[0].evidence, ElectrodeEvidence::Unknown);
-        scan.candidates[0].study_date = Some("20250101".into());
-        recommend(&mut scan);
         assert_eq!(scan.preop_mri, Some(0));
+        assert_eq!(scan.candidates[0].evidence, ElectrodeEvidence::LikelyAbsent);
         scan.candidates[0].explicit_postop = true;
         recommend(&mut scan);
         assert_eq!(scan.preop_mri, None);
+        assert!(scan.preop_mris.is_empty());
+    }
+    #[test]
+    fn soft_tissue_ct_kernel_beats_bone_kernel_at_thin_spacing() {
+        let mut bone = candidate(4, "bone", Modality::Ct, ElectrodeEvidence::Detected);
+        bone.ct_kernel = CtKernel::Bone;
+        bone.spacing_mm = [0.5, 0.5, 0.5];
+        bone.quality = 5.0;
+        let mut soft = candidate(4, "soft", Modality::Ct, ElectrodeEvidence::Detected);
+        soft.ct_kernel = CtKernel::SoftTissue;
+        soft.spacing_mm = [0.5, 0.5, 0.6];
+        soft.quality = 4.0;
+        let mut scan = Scan {
+            candidates: vec![bone, soft],
+            ..Scan::default()
+        };
+        recommend(&mut scan);
+        assert_eq!(scan.postop_ct, Some(1));
+    }
+    #[test]
+    fn intracranial_ct_mask_ignores_outer_frame_metal() {
+        // 64x64 axial CT slice with a circular skull ring (1000 HU) centered at (32, 32), radius 20.
+        let w = 64usize;
+        let h = 64usize;
+        let mut pixels = vec![-1000.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let dx = x as f32 - 32.0;
+                let dy = y as f32 - 32.0;
+                let r = (dx * dx + dy * dy).sqrt();
+                if (18.0..=22.0).contains(&r) {
+                    pixels[y * w + x] = 1000.0; // skull bone
+                } else if r < 18.0 {
+                    pixels[y * w + x] = 35.0; // brain parenchyma
+                }
+            }
+        }
+        // Place stereotactic frame metal pin OUTSIDE the skull at (8, 32) and (56, 32).
+        for dy in 0..3 {
+            for dx in 0..3 {
+                pixels[(31 + dy) * w + (7 + dx)] = 3071.0;
+                pixels[(31 + dy) * w + (55 + dx)] = 3071.0;
+            }
+        }
+        let frame_only = Preview {
+            width: w,
+            height: h,
+            pixels: pixels.clone(),
+        };
+        let (metal_outer, _, used_mask) = count_ct_intracranial_metal(&frame_only, [1.0, 1.0]);
+        assert!(used_mask);
+        assert_eq!(metal_outer, 0, "outer frame metal must be ignored");
+
+        // Now add a real intracranial DBS electrode contact at (28, 32) inside the skull.
+        for dy in 0..2 {
+            for dx in 0..2 {
+                pixels[(31 + dy) * w + (28 + dx)] = 3071.0;
+            }
+        }
+        let with_lead = Preview {
+            width: w,
+            height: h,
+            pixels,
+        };
+        let (metal_inner, max_hu, used_mask) = count_ct_intracranial_metal(&with_lead, [1.0, 1.0]);
+        assert!(used_mask);
+        assert_eq!(metal_inner, 4);
+        assert!(max_hu >= 3000.0);
     }
     #[test]
     fn cancellation_and_traversal() {

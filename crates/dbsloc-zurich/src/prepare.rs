@@ -9,7 +9,21 @@ use std::sync::atomic::AtomicBool;
 use dbsloc_pipeline::import::{self, ImportItem, Session};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 
-use crate::{check_cancel, io, reject_traversal, Candidate, Error, Modality, Progress, Scan};
+use crate::{
+    check_cancel, fallback, io, reject_traversal, Candidate, ContrastSource, Error, IntensityStats,
+    Modality, Progress, Scan,
+};
+
+/// One converted & sanitized volume produced by [`prepare_study`], carrying provenance of how its
+/// anatomical contrast was determined (including broken-header Tier 2/3 fallbacks).
+#[derive(Clone, Debug)]
+pub struct PreparedStudyItem {
+    pub candidate_index: usize,
+    pub item: ImportItem,
+    pub contrast_source: ContrastSource,
+    pub contrast_reason: String,
+    pub intensity_stats: Option<IntensityStats>,
+}
 
 struct Cleanup(Option<PathBuf>);
 impl Drop for Cleanup {
@@ -299,6 +313,216 @@ pub fn prepare_selection(
     Ok(items)
 }
 
+/// Convert the chosen best CT and all selected anatomical MR series from the chosen MR study into
+/// sanitized temporary NIfTI items. When an MR series has broken/missing DICOM contrast headers,
+/// automatically runs the Tier 2 (`dcm2niix` sidecar physics) and Tier 3 (3D NIfTI intensity)
+/// fallbacks before scrubbing.
+pub fn prepare_study(
+    scan: &Scan,
+    mris: &[usize],
+    ct: usize,
+    output: &Path,
+    cancel: &AtomicBool,
+    progress: impl Fn(Progress) + Sync,
+) -> Result<Vec<PreparedStudyItem>, Error> {
+    check_cancel(cancel)?;
+    reject_traversal(output)?;
+    if mris.is_empty() {
+        return Err(Error::Selection("at least one MRI series is required"));
+    }
+    let ct_cand = scan
+        .candidates
+        .get(ct)
+        .ok_or(Error::Selection("CT index out of range"))?;
+    if ct_cand.modality != Modality::Ct || !ct_cand.eligible || ct_cand.slices.is_empty() {
+        return Err(Error::Selection("choose a supported non-scout CT volume"));
+    }
+    let mut selected: Vec<(usize, &Candidate, bool)> = Vec::with_capacity(mris.len() + 1);
+    let mut seen_idx = std::collections::HashSet::new();
+    for &idx in mris {
+        if idx == ct || !seen_idx.insert(idx) {
+            continue;
+        }
+        let m = scan
+            .candidates
+            .get(idx)
+            .ok_or(Error::Selection("MRI index out of range"))?;
+        if m.modality != Modality::Mr || !m.eligible || m.slices.is_empty() {
+            return Err(Error::Selection("choose supported non-scout MRI volumes"));
+        }
+        selected.push((idx, m, true));
+    }
+    if selected.is_empty() {
+        return Err(Error::Selection(
+            "at least one valid MRI series is required",
+        ));
+    }
+    selected.push((ct, ct_cand, false));
+
+    if output.exists() {
+        return Err(Error::OutputExists);
+    }
+    let parent = output
+        .parent()
+        .ok_or(Error::Selection("temporary output needs a parent"))?;
+    let parent = crate::canonical_path(parent).map_err(|e| io("open temporary parent", e))?;
+    let name = output
+        .file_name()
+        .ok_or(Error::Selection("temporary output needs a directory name"))?;
+    let output = parent.join(name);
+    std::fs::create_dir(&output).map_err(|e| io("create preparation directory", e))?;
+    let mut cleanup = Cleanup(Some(output.clone()));
+
+    let total = selected
+        .iter()
+        .map(|(_, s, _)| s.slices.len())
+        .sum::<usize>()
+        + selected.len() * 2;
+    let mut done = 0usize;
+    let mut out = Vec::with_capacity(selected.len());
+
+    for (i, (cand_idx, candidate, is_mr)) in selected.into_iter().enumerate() {
+        check_cancel(cancel)?;
+        let label = if is_mr { "MRI" } else { "CT" };
+        let stage = output.join(format!("stage_{i}"));
+        let converted = output.join(format!("converted_{i}"));
+        std::fs::create_dir(&stage)
+            .map_err(|e| io("create selected-slice staging directory", e))?;
+        let session = std::fs::canonicalize(&candidate.session_path)
+            .map_err(|e| io("open selected session", e))?;
+        for (n, slice) in candidate.slices.iter().enumerate() {
+            check_cancel(cancel)?;
+            reject_traversal(&slice.path)?;
+            let meta = std::fs::symlink_metadata(&slice.path)
+                .map_err(|e| io("inspect selected DICOM", e))?;
+            if meta.file_type().is_symlink() {
+                return Err(Error::Selection("symlinked DICOM slices are not supported"));
+            }
+            let source =
+                std::fs::canonicalize(&slice.path).map_err(|e| io("open selected DICOM", e))?;
+            if !source.starts_with(&session) {
+                return Err(Error::Selection(
+                    "DICOM slice lies outside selected session",
+                ));
+            }
+            std::fs::copy(&source, stage.join(format!("slice_{n:06}.dcm")))
+                .map_err(|e| io("stage selected DICOM", e))?;
+            done += 1;
+            if n % 32 == 0 || n + 1 == candidate.slices.len() {
+                progress(Progress {
+                    done,
+                    total,
+                    label: format!("Preparing selected {label} ({}/{})", i + 1, out.capacity()),
+                });
+            }
+        }
+        progress(Progress {
+            done,
+            total,
+            label: format!("Converting selected {label} ({}/{})", i + 1, out.capacity()),
+        });
+        check_cancel(cancel)?;
+        let mut volumes =
+            import::convert_dicom_with(&stage, &converted, cancel, &import::default_lookup_table())
+                .map_err(|e| {
+                    if e.code == import::E_IMPORT_CANCELLED {
+                        Error::Cancelled
+                    } else {
+                        Error::Conversion(e)
+                    }
+                })?;
+        done += 1;
+        if volumes.len() != 1 {
+            return Err(Error::VolumeCount {
+                target: label,
+                count: volumes.len(),
+            });
+        }
+        let volume = volumes.remove(0);
+
+        // Broken-header fallback (Tier 2 sidecar -> Tier 3 3D intensity) for unrecognized MRs.
+        let (suffix, contrast_source, contrast_reason, intensity_stats) = if !is_mr {
+            (
+                "CT".to_owned(),
+                ContrastSource::DicomText,
+                "CT volume".to_owned(),
+                None,
+            )
+        } else if let Some(s) = candidate
+            .suffix
+            .as_deref()
+            .filter(|s| import::PREOP_SUFFIXES.contains(s))
+        {
+            (
+                s.to_owned(),
+                candidate.contrast_source,
+                candidate.suffix_reason.clone(),
+                None,
+            )
+        } else {
+            let (src, guessed, stats) =
+                fallback::fallback_mri_contrast(volume.sidecar.as_deref(), &volume.nifti);
+            match guessed {
+                Some((s, r)) if import::PREOP_SUFFIXES.contains(&s.as_str()) => (s, src, r, stats),
+                _ => (
+                    "T1w".to_owned(),
+                    ContrastSource::Unknown,
+                    "Broken headers and inconclusive intensity; defaulted to T1w — verify in QC"
+                        .to_owned(),
+                    stats,
+                ),
+            }
+        };
+
+        let source = output.join(format!("selected_{i}.nii.gz"));
+        let sidecar = output.join(format!("selected_{i}.json"));
+        scrub_nifti(&volume.nifti, &source, cancel)?;
+        scrub_sidecar(
+            volume.sidecar.as_deref(),
+            &sidecar,
+            if is_mr { "MR" } else { "CT" },
+        )?;
+        import::nifti_summary(&source)?;
+        let acq = if is_mr {
+            volume
+                .suggested
+                .acq
+                .or_else(|| candidate.orientation.map(|o| o.to_import_acq()))
+        } else {
+            None
+        };
+        out.push(PreparedStudyItem {
+            candidate_index: cand_idx,
+            item: ImportItem {
+                source,
+                sidecar: Some(sidecar),
+                session: if is_mr {
+                    Session::Preop
+                } else {
+                    Session::Postop
+                },
+                suffix,
+                acq,
+            },
+            contrast_source,
+            contrast_reason,
+            intensity_stats,
+        });
+        std::fs::remove_dir_all(&stage)
+            .map_err(|e| io("remove selected-slice staging directory", e))?;
+        std::fs::remove_dir_all(&converted).map_err(|e| io("remove converter metadata", e))?;
+        done += 1;
+        progress(Progress {
+            done,
+            total,
+            label: format!("Prepared selected {label}"),
+        });
+    }
+    check_cancel(cancel)?;
+    cleanup.0 = None;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +557,10 @@ mod tests {
             quality: 0.,
             explicit_preop: false,
             explicit_postop: false,
+            ct_kernel: crate::CtKernel::Unknown,
+            orientation: None,
+            contrast_source: crate::ContrastSource::Unknown,
+            telemetry: crate::ArtifactTelemetry::default(),
             slices: vec![crate::Slice {
                 path: source.clone(),
                 rows: 1,

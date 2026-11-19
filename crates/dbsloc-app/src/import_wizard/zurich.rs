@@ -592,6 +592,10 @@ mod tests {
             quality: 80.0,
             explicit_preop: false,
             explicit_postop: false,
+            ct_kernel: dbsloc_zurich::CtKernel::Unknown,
+            orientation: None,
+            contrast_source: dbsloc_zurich::ContrastSource::Unknown,
+            telemetry: dbsloc_zurich::ArtifactTelemetry::default(),
         }
     }
 
@@ -622,6 +626,7 @@ mod tests {
                 scan: Some(Arc::new(Scan {
                     candidates: vec![mri, ct],
                     preop_mri: Some(0),
+                    preop_mris: vec![0],
                     postop_ct: Some(1),
                     warnings: Vec::new(),
                 })),
@@ -661,6 +666,7 @@ mod tests {
                 candidate(Modality::Ct, Some("CT")),
             ],
             preop_mri: Some(0),
+            preop_mris: vec![0],
             postop_ct: Some(1),
             warnings: Vec::new(),
         });
